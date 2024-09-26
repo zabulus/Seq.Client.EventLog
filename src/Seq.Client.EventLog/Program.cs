@@ -1,6 +1,9 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Configuration.Install;
+using System.Diagnostics.Eventing.Reader;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.ServiceProcess;
 using System.Threading;
@@ -16,33 +19,81 @@ namespace Seq.Client.EventLog
         /// by passing the /install or /uninstall argument, and can be run
         /// interactively by specifying the path to the JSON configuration file.
         /// </summary>
-        public static void Main(string[] args)
+        
+
+        public static RawEvents ToDto(this EventRecord entry, string logName)
         {
-            // Allows the installation and uninstallation via the command line
-            if (Environment.UserInteractive)
+            return new RawEvents
             {
-                var parameter = string.Concat(args);
-                if (string.IsNullOrWhiteSpace(parameter))
+                Events = new[]
                 {
-                    parameter = null;
+                    new RawEvent
+                    {
+                        Timestamp = entry.TimeCreated ?? DateTime.MinValue,
+                        Level = MapLevel(entry),
+                        MessageTemplate = entry.FormatDescription(),
+                        Properties = new Dictionary<string, object>
+                        {
+                            { "MachineName", entry.MachineName },
+#pragma warning disable 618
+                            { "EventId", entry.Id },
+#pragma warning restore 618
+                            { "InstanceId", entry.MachineName },
+                            { "Source", entry.ProviderName },
+                            //{ "Category", entry. },
+                            { "EventLogName", logName }
+                        }
+                    },
+                }
+            };
+
+            string MapLevel(EventRecord eventRecord)
+            {
+                string ret;
+                try
+                {
+                    ret = eventRecord.LevelDisplayName;
+                    return ret;
+                }
+                catch
+                {
+                    
                 }
 
-                switch (parameter)
+                switch (eventRecord.Level)
                 {
-                    case "/install":
-                        ManagedInstallerClass.InstallHelper(new[] { Assembly.GetExecutingAssembly().Location });
-                        break;
-                    case "/uninstall":
-                        ManagedInstallerClass.InstallHelper(new[] { "/u", Assembly.GetExecutingAssembly().Location });
-                        break;
-                    default:
-                        RunInteractive(parameter);
-                        break;
+                    case 4: return "Information";
+                    case 3: return "Warning";
+                    case 2: return "Error";
+                    case 1: return "Fatal";
                 }
+
+                throw new NotImplementedException();
             }
-            else
+        }
+
+        public static void Main(string[] args)
+        {
+            string[] filePaths;
+            if (File.Exists(args[0]))
             {
-                RunService();
+                filePaths = new[] { args[0] };
+            }
+            else if (Directory.Exists(args[0]))
+            {
+                filePaths = Directory.EnumerateFiles(args[0], "*.evtx", SearchOption.AllDirectories).ToArray();
+            }
+            else throw new InvalidOperationException();
+
+            foreach (var filePath in filePaths)
+            {
+                var logName = Path.GetFileName(filePath);
+                EventLogReader reader = new EventLogReader(filePath, PathType.FilePath);
+                EventRecord record;
+                while ((record = reader.ReadEvent()) != null)
+                {
+                    SeqApi.PostRawEvents(record.ToDto(logName)).Wait();
+                }
             }
         }
 
@@ -74,39 +125,6 @@ namespace Seq.Client.EventLog
             {
                 Log.Fatal(ex, "An unhandled exception occurred");
                 Environment.ExitCode = 1;
-            }
-            finally
-            {
-                Log.CloseAndFlush();
-            }
-        }
-
-        static void RunService()
-        {
-            var logFile = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                typeof(Program).Assembly.GetName().Name,
-                "ServiceLog.txt");
-
-            Log.Logger = new LoggerConfiguration()
-                .WriteTo.File(
-                    logFile,
-                    rollingInterval: RollingInterval.Day,
-                    rollOnFileSizeLimit: true,
-                    retainedFileCountLimit: 7,
-                    fileSizeLimitBytes: 10_000_000,
-                    shared: true)
-                .CreateLogger();
-
-            try
-            {
-                Log.Information("Running as service");
-                ServiceBase.Run(new Service());
-                Log.Information("Stopped");
-            }
-            catch (Exception ex)
-            {
-                Log.Fatal(ex, "Exception thrown from service host");
             }
             finally
             {
